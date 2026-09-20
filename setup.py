@@ -414,7 +414,7 @@ cloudflared_log = open(
 )
 
 cloudflared_process = subprocess.Popen(
-    [ 
+    [
         "cloudflared",
         "tunnel",
         "--no-autoupdate",
@@ -422,6 +422,8 @@ cloudflared_process = subprocess.Popen(
         "http2",
         "--url",
         "http://127.0.0.1:11434",
+        "--http-host-header",
+        "127.0.0.1:11434",
     ],
     stdout=cloudflared_log,
     stderr=subprocess.STDOUT,
