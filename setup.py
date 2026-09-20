@@ -1,19 +1,19 @@
-#!/usr/bin/env python3
-
 import os
 import re
 import sys
+import json
 import time
 import signal
 import shutil
-import socket
 import subprocess
 import urllib.request
+import urllib.error
 from pathlib import Path
 
-
 # ============================================================
+
 # CONFIGURATION
+
 # ============================================================
 
 MODEL_REPO = "JonathanColetti/Qwen3.8-27B-Uncensored-GGUF"
@@ -23,288 +23,395 @@ OLLAMA_MODEL = "qwen38-27b"
 WORK_DIR = Path("/kaggle/working")
 MODEL_DIR = WORK_DIR / "qwen38"
 MODEL_PATH = MODEL_DIR / MODEL_FILE
+
 MODELFILE_PATH = WORK_DIR / "Modelfile"
 
 OLLAMA_HOST = "127.0.0.1:11434"
 OLLAMA_API = f"http://{OLLAMA_HOST}"
 
-CLOUDFLARED_DEB = WORK_DIR / "cloudflared-linux-amd64.deb"
+OLLAMA_LOG = WORK_DIR / "ollama.log"
 CLOUDFLARED_LOG = WORK_DIR / "cloudflared.log"
 
-# 2x Tesla T4
+CLOUDFLARED_DEB = WORK_DIR / "cloudflared-linux-amd64.deb"
+
+OLLAMA_PID_FILE = WORK_DIR / "ollama.pid"
+CLOUDFLARED_PID_FILE = WORK_DIR / "cloudflared.pid"
+
+# GPU configuration
+
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 
 # Ollama configuration
+
 os.environ["OLLAMA_HOST"] = OLLAMA_HOST
 os.environ["OLLAMA_KEEP_ALIVE"] = "-1"
 
 # ============================================================
+
 # HELPERS
+
 # ============================================================
 
-processes = []
-
-
-def run(command, check=True, capture=False):
-    """Run shell command."""
-    print("\n$ " + " ".join(map(str, command)))
-
-    return subprocess.run(
-        command,
-        check=check,
-        text=True,
-        capture_output=capture,
-    )
-
+def log(message=""):
+print(f"[SETUP] {message}", flush=True)
 
 def command_exists(command):
-    return shutil.which(command) is not None
+return shutil.which(command) is not None
+
+def run(command, check=True, capture=False, env=None):
+command = [str(x) for x in command]
 
 
-def wait_for_port(host, port, timeout=60):
-    """Wait until TCP port becomes available."""
-    start = time.time()
+log("$ " + " ".join(command))
 
-    while time.time() - start < timeout:
-        try:
-            with socket.create_connection((host, port), timeout=2):
-                return True
-        except OSError:
-            time.sleep(1)
+return subprocess.run(
+    command,
+    check=check,
+    text=True,
+    capture_output=capture,
+    env=env,
+)
 
+
+def process_alive(pid):
+if not pid:
+return False
+
+
+try:
+    os.kill(int(pid), 0)
+    return True
+except (ProcessLookupError, ValueError):
     return False
+except PermissionError:
+    return True
 
+
+def read_pid_file(path):
+if not path.exists():
+return None
+
+
+try:
+    return int(path.read_text().strip())
+except Exception:
+    return None
+
+
+def write_pid_file(path, pid):
+path.write_text(str(pid))
 
 def http_get(url, timeout=10):
-    """Simple HTTP GET without requiring requests."""
+try:
+request = urllib.request.Request(
+url,
+headers={
+"User-Agent": "kaggle-ollama-setup"
+},
+)
+
+
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        body = response.read().decode("utf-8", errors="replace")
+        return response.status, body
+
+except urllib.error.HTTPError as error:
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
-            body = response.read().decode("utf-8", errors="replace")
-            return response.status, body
-    except Exception as e:
-        return None, str(e)
+        body = error.read().decode("utf-8", errors="replace")
+    except Exception:
+        body = ""
+
+    return error.code, body
+
+except Exception as error:
+    return None, str(error)
 
 
-def terminate_processes():
-    """Clean up child processes."""
-    for process in processes:
-        try:
-            if process.poll() is None:
-                process.terminate()
-        except Exception:
-            pass
+def wait_for_ollama(timeout=60):
+log("Checking Ollama API...")
 
 
-def signal_handler(signum, frame):
-    print("\nStopping processes...")
-    terminate_processes()
-    sys.exit(0)
+start = time.time()
+
+while time.time() - start < timeout:
+    status, body = http_get(f"{OLLAMA_API}/api/tags", timeout=3)
+
+    if status == 200:
+        log("Ollama API is ready.")
+        return True
+
+    time.sleep(2)
+
+return False
 
 
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
+def get_ollama_models():
+status, body = http_get(f"{OLLAMA_API}/api/tags", timeout=5)
 
-
-# ============================================================
-# 1. SYSTEM UPDATE
-# ============================================================
-
-print("=" * 70)
-print("1/9 - Updating Ubuntu package lists")
-print("=" * 70)
-
-run(["apt-get", "update"])
-
-
-# ============================================================
-# 2. INSTALL SYSTEM DEPENDENCIES
-# ============================================================
-
-print("=" * 70)
-print("2/9 - Installing system dependencies")
-print("=" * 70)
-
-run([
-    "apt-get",
-    "install",
-    "-y",
-    "zstd",
-    "curl",
-    "wget",
-    "ca-certificates",
-])
-
-
-# ============================================================
-# 3. INSTALL OLLAMA
-# ============================================================
-
-print("=" * 70)
-print("3/9 - Installing Ollama")
-print("=" * 70)
-
-if command_exists("ollama"):
-    print("Ollama is already installed.")
-else:
-    install_script = WORK_DIR / "install-ollama.sh"
-
-    with open(install_script, "wb") as f:
-        response = urllib.request.urlopen(
-            "https://ollama.com/install.sh",
-            timeout=60,
-        )
-        f.write(response.read())
-
-    os.chmod(install_script, 0o755)
-
-    run(["bash", str(install_script)])
-
-print("\nOllama version:")
-run(["ollama", "--version"])
-
-
-# ============================================================
-# 4. START OLLAMA SERVER
-# ============================================================
-
-print("=" * 70)
-print("4/9 - Starting Ollama server")
-print("=" * 70)
-
-# Avoid starting a second Ollama server.
-status, body = http_get(f"{OLLAMA_API}/api/tags")
-
-if status == 200:
-    print("Ollama is already running.")
-else:
-    print("Starting Ollama in background...")
-
-    ollama_log = open(WORK_DIR / "ollama.log", "a")
-
-    ollama_process = subprocess.Popen(
-        ["ollama", "serve"],
-        stdout=ollama_log,
-        stderr=subprocess.STDOUT,
-        env=os.environ.copy(),
-    )
-
-    processes.append(ollama_process)
-
-    print("Ollama PID:", ollama_process.pid)
-
-    if not wait_for_port("127.0.0.1", 11434, timeout=60):
-        print("\nERROR: Ollama did not open port 11434.")
-        print("Check:")
-        print(WORK_DIR / "ollama.log")
-        sys.exit(1)
-
-
-# ============================================================
-# 5. TEST OLLAMA API
-# ============================================================
-
-print("=" * 70)
-print("5/9 - Testing Ollama API")
-print("=" * 70)
-
-status, body = http_get(f"{OLLAMA_API}/api/tags")
 
 if status != 200:
-    print("ERROR: Ollama API is not responding.")
-    print("Status:", status)
-    print("Response:", body)
-    sys.exit(1)
+    return []
 
-print("Ollama API: OK")
-print(body[:1000])
-
-
-# ============================================================
-# 6. INSTALL HUGGING FACE HUB
-# ============================================================
-
-print("=" * 70)
-print("6/9 - Installing Hugging Face Hub")
-print("=" * 70)
-
-run([
-    sys.executable,
-    "-m",
-    "pip",
-    "install",
-    "-q",
-    "-U",
-    "huggingface_hub",
-])
-
-# Locate hf executable
-hf_command = shutil.which("hf")
-
-if not hf_command:
-    candidate = Path(sys.executable).parent / "hf"
-
-    if candidate.exists():
-        hf_command = str(candidate)
-
-if not hf_command:
-    print("ERROR: 'hf' command was not found.")
-    sys.exit(1)
-
-print("Hugging Face CLI:", hf_command)
+try:
+    data = json.loads(body)
+    return [
+        model.get("name", "")
+        for model in data.get("models", [])
+    ]
+except Exception:
+    return []
 
 
 # ============================================================
-# 7. DOWNLOAD GGUF
+
+# CREATE DIRECTORIES
+
 # ============================================================
 
-print("=" * 70)
-print("7/9 - Downloading GGUF model")
-print("=" * 70)
+log("Creating required directories...")
 
+WORK_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-if MODEL_PATH.exists():
-    size_gb = MODEL_PATH.stat().st_size / (1024 ** 3)
+log(f"Working directory : {WORK_DIR}")
+log(f"Model directory   : {MODEL_DIR}")
 
-    print(
-        f"Model already exists: {MODEL_PATH}"
-    )
-    print(
-        f"Size: {size_gb:.2f} GB"
-    )
+# ============================================================
+
+# SYSTEM INFORMATION
+
+# ============================================================
+
+log("Checking GPU...")
+
+if command_exists("nvidia-smi"):
+run(["nvidia-smi"], check=False)
 else:
-    print("Downloading:")
-    print(f"Repository : {MODEL_REPO}")
-    print(f"File       : {MODEL_FILE}")
-    print(f"Destination: {MODEL_DIR}")
+log("WARNING: nvidia-smi was not found.")
 
-    run([
-        hf_command,
+# ============================================================
+
+# APT / SYSTEM DEPENDENCIES
+
+# ============================================================
+
+log("Installing system dependencies...")
+
+if os.geteuid() == 0:
+SUDO = []
+else:
+SUDO = ["sudo"]
+
+run(
+SUDO + ["apt-get", "update"],
+check=True,
+)
+
+run(
+SUDO + [
+"apt-get",
+"install",
+"-y",
+"curl",
+"wget",
+"zstd",
+"ca-certificates",
+"git",
+],
+check=True,
+)
+
+# ============================================================
+
+# INSTALL OLLAMA
+
+# ============================================================
+
+if command_exists("ollama"):
+log("Ollama is already installed.")
+
+
+try:
+    result = run(
+        ["ollama", "--version"],
+        check=False,
+        capture=True,
+    )
+
+    output = (result.stdout or result.stderr).strip()
+
+    if output:
+        log(output)
+
+except Exception:
+    pass
+
+
+else:
+log("Installing Ollama...")
+
+
+run(
+    [
+        "bash",
+        "-c",
+        "curl -fsSL https://ollama.com/install.sh | sh",
+    ],
+    check=True,
+)
+
+
+if not command_exists("ollama"):
+log("ERROR: Ollama installation failed.")
+sys.exit(1)
+
+# ============================================================
+
+# START OLLAMA
+
+# ============================================================
+
+ollama_pid = read_pid_file(OLLAMA_PID_FILE)
+
+if ollama_pid and process_alive(ollama_pid):
+log(f"Ollama process already running. PID={ollama_pid}")
+
+elif wait_for_ollama(timeout=3):
+log("Ollama is already running.")
+
+else:
+log("Starting Ollama server...")
+
+
+ollama_log_file = open(
+    OLLAMA_LOG,
+    "a",
+    buffering=1,
+)
+
+ollama_process = subprocess.Popen(
+    ["ollama", "serve"],
+    stdout=ollama_log_file,
+    stderr=subprocess.STDOUT,
+    env=os.environ.copy(),
+    start_new_session=True,
+)
+
+write_pid_file(
+    OLLAMA_PID_FILE,
+    ollama_process.pid,
+)
+
+log(f"Ollama started. PID={ollama_process.pid}")
+
+if not wait_for_ollama(timeout=60):
+    log("ERROR: Ollama API did not become ready.")
+
+    log("Last Ollama log:")
+    try:
+        print(OLLAMA_LOG.read_text()[-5000:])
+    except Exception:
+        pass
+
+    sys.exit(1)
+
+
+# ============================================================
+
+# INSTALL HUGGING FACE HUB
+
+# ============================================================
+
+log("Installing/updating Hugging Face Hub...")
+
+run(
+[
+sys.executable,
+"-m",
+"pip",
+"install",
+"-q",
+"-U",
+"huggingface_hub",
+],
+check=True,
+)
+
+# ============================================================
+
+# FIND HF CLI
+
+# ============================================================
+
+HF_COMMAND = shutil.which("hf")
+
+if HF_COMMAND is None:
+possible_hf = [
+Path(sys.executable).parent / "hf",
+Path.home() / ".local" / "bin" / "hf",
+]
+
+
+for candidate in possible_hf:
+    if candidate.exists():
+        HF_COMMAND = str(candidate)
+        break
+
+
+if HF_COMMAND is None:
+log("ERROR: Hugging Face CLI 'hf' was not found.")
+sys.exit(1)
+
+log(f"Hugging Face CLI: {HF_COMMAND}")
+
+# ============================================================
+
+# DOWNLOAD GGUF
+
+# ============================================================
+
+if MODEL_PATH.exists():
+size_gb = MODEL_PATH.stat().st_size / (1024 ** 3)
+
+
+log(
+    f"GGUF already exists: "
+    f"{MODEL_PATH} "
+    f"({size_gb:.2f} GB)"
+)
+
+
+else:
+log("GGUF model not found.")
+log("Downloading model from Hugging Face...")
+log(f"Repository : {MODEL_REPO}")
+log(f"File       : {MODEL_FILE}")
+
+
+run(
+    [
+        HF_COMMAND,
         "download",
         MODEL_REPO,
         MODEL_FILE,
         "--local-dir",
         str(MODEL_DIR),
-    ])
+    ],
+    check=True,
+)
+
 
 if not MODEL_PATH.exists():
-    print("\nERROR: GGUF file was not downloaded.")
-    sys.exit(1)
-
-size_gb = MODEL_PATH.stat().st_size / (1024 ** 3)
-
-print("\nGGUF download complete:")
-print(MODEL_PATH)
-print(f"Size: {size_gb:.2f} GB")
-
+log("ERROR: GGUF download failed.")
+sys.exit(1)
 
 # ============================================================
-# 8. CREATE OLLAMA MODEL
+
+# CREATE OLLAMA MODELFILE
+
 # ============================================================
 
-print("=" * 70)
-print("8/9 - Creating Ollama model")
-print("=" * 70)
+log("Creating Ollama Modelfile...")
 
 MODELFILE_CONTENT = f"""FROM {MODEL_PATH}
 
@@ -314,88 +421,163 @@ PARAMETER top_p 0.9
 """
 
 MODELFILE_PATH.write_text(
-    MODELFILE_CONTENT,
-    encoding="utf-8",
+MODELFILE_CONTENT,
+encoding="utf-8",
 )
 
-print("Modelfile:")
-print(MODELFILE_CONTENT)
+log(f"Modelfile: {MODELFILE_PATH}")
 
-# Check if model already exists
-status, body = http_get(f"{OLLAMA_API}/api/tags")
+# ============================================================
 
-model_exists = (
-    status == 200
-    and f'"name":"{OLLAMA_MODEL}' in body
+# CREATE OLLAMA MODEL
+
+# ============================================================
+
+log("Checking whether Ollama model already exists...")
+
+existing_models = get_ollama_models()
+
+model_exists = any(
+name == OLLAMA_MODEL
+or name == f"{OLLAMA_MODEL}:latest"
+for name in existing_models
 )
 
 if model_exists:
-    print(f"Model '{OLLAMA_MODEL}' already exists.")
+log(
+f"Ollama model already exists: "
+f"{OLLAMA_MODEL}"
+)
+
 else:
-    run([
+log(f"Creating Ollama model: {OLLAMA_MODEL}")
+
+
+run(
+    [
         "ollama",
         "create",
         OLLAMA_MODEL,
         "-f",
         str(MODELFILE_PATH),
-    ])
+    ],
+    check=True,
+)
 
-print("\nInstalled Ollama models:")
-run(["ollama", "list"])
+log("Ollama model created successfully.")
 
 
 # ============================================================
-# 9. INSTALL + START CLOUDFLARED
+
+# VERIFY LOCAL OLLAMA MODEL
+
 # ============================================================
 
-print("=" * 70)
-print("9/9 - Installing Cloudflare Tunnel")
-print("=" * 70)
+log("Verifying local Ollama model...")
+
+models = get_ollama_models()
+
+if not any(
+name == OLLAMA_MODEL
+or name == f"{OLLAMA_MODEL}:latest"
+for name in models
+):
+log("WARNING: Model was not found through /api/tags.")
+
+
+log("Current Ollama models:")
+for model in models:
+    print(" -", model)
+
+
+else:
+log(f"Model ready: {OLLAMA_MODEL}")
+
+# ============================================================
+
+# INSTALL CLOUDFLARED
+
+# ============================================================
 
 if command_exists("cloudflared"):
-    print("cloudflared is already installed.")
-else:
-    if not CLOUDFLARED_DEB.exists():
-        print("Downloading cloudflared...")
+log("cloudflared is already installed.")
 
-        run([
+else:
+log("Installing cloudflared...")
+
+
+if not CLOUDFLARED_DEB.exists():
+    run(
+        [
             "wget",
             "-q",
+            "--show-progress",
             "-O",
             str(CLOUDFLARED_DEB),
             "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb",
-        ])
+        ],
+        check=True,
+    )
 
-    run([
+run(
+    SUDO + [
         "dpkg",
         "-i",
         str(CLOUDFLARED_DEB),
-    ], check=False)
+    ],
+    check=False,
+)
 
-    # Fix dependencies if necessary
-    if not command_exists("cloudflared"):
-        run(["apt-get", "install", "-f", "-y"])
+# Fix missing dependencies if necessary.
+run(
+    SUDO + [
+        "apt-get",
+        "-f",
+        "install",
+        "-y",
+    ],
+    check=False,
+)
 
 
-print("\ncloudflared version:")
-run(["cloudflared", "--version"])
-
+if not command_exists("cloudflared"):
+log("ERROR: cloudflared installation failed.")
+sys.exit(1)
 
 # ============================================================
-# START QUICK TUNNEL
+
+# START CLOUDFLARE QUICK TUNNEL
+
 # ============================================================
 
-print("=" * 70)
-print("Starting Cloudflare Quick Tunnel")
-print("=" * 70)
+cloudflared_pid = read_pid_file(CLOUDFLARED_PID_FILE)
 
-# Remove previous log
+cloudflared_running = (
+cloudflared_pid is not None
+and process_alive(cloudflared_pid)
+)
+
+if cloudflared_running:
+log(
+f"cloudflared tunnel already running. "
+f"PID={cloudflared_pid}"
+)
+
+else:
+log("Starting Cloudflare Quick Tunnel...")
+
+
+# Clear old URL/log information.
 try:
     CLOUDFLARED_LOG.unlink()
 except FileNotFoundError:
     pass
 
-log_file = open(CLOUDFLARED_LOG, "w")
+cloudflared_log_file = open(
+    CLOUDFLARED_LOG,
+    "w",
+    buffering=1,
+)
 
 cloudflared_process = subprocess.Popen(
     [
@@ -405,141 +587,253 @@ cloudflared_process = subprocess.Popen(
         "--url",
         OLLAMA_API,
     ],
-    stdout=log_file,
+    stdout=cloudflared_log_file,
     stderr=subprocess.STDOUT,
-    text=True,
+    start_new_session=True,
 )
 
-processes.append(cloudflared_process)
-
-print("cloudflared PID:", cloudflared_process.pid)
-
-# Wait for tunnel URL
-tunnel_url = None
-pattern = re.compile(
-    r"https://[a-zA-Z0-9.-]+\.trycloudflare\.com"
+write_pid_file(
+    CLOUDFLARED_PID_FILE,
+    cloudflared_process.pid,
 )
 
-print("\nWaiting for Cloudflare URL...")
+cloudflared_pid = cloudflared_process.pid
+
+log(
+    f"cloudflared started. "
+    f"PID={cloudflared_pid}"
+)
+
+
+# ============================================================
+
+# FIND PUBLIC CLOUDFLARE URL
+
+# ============================================================
+
+log("Waiting for Cloudflare public URL...")
+
+public_url = None
 
 for _ in range(60):
-    time.sleep(1)
-
-    try:
-        log_text = CLOUDFLARED_LOG.read_text(
-            encoding="utf-8",
-            errors="replace",
-        )
-    except Exception:
-        continue
-
-    match = pattern.search(log_text)
-
-    if match:
-        tunnel_url = match.group(0)
-        break
-
-if not tunnel_url:
-    print("\nERROR: Cloudflare tunnel URL was not detected.")
-    print("\nCloudflared log:")
-    print(CLOUDFLARED_LOG.read_text(
-        encoding="utf-8",
-        errors="replace",
-    ))
-
-    sys.exit(1)
+time.sleep(2)
 
 
-# ============================================================
-# TEST PUBLIC API
-# ============================================================
-
-print("\n" + "=" * 70)
-print("TUNNEL READY")
-print("=" * 70)
-
-print("\nPublic Ollama URL:")
-print(tunnel_url)
-
-print("\nTesting public /api/tags endpoint...")
-
-status, body = http_get(
-    tunnel_url + "/api/tags",
-    timeout=30,
-)
-
-print("HTTP status:", status)
-
-if status == 200:
-    print("PUBLIC API: OK")
-else:
-    print("PUBLIC API TEST FAILED")
-    print(body[:2000])
-
-print("\n" + "=" * 70)
-print("IMPORTANT")
-print("=" * 70)
-
-print(
-    "\nOllama API:"
-)
-print(tunnel_url)
-
-print(
-    "\nModels:"
-)
-print(tunnel_url + "/api/tags")
-
-print(
-    "\nGenerate:"
-)
-print(tunnel_url + "/api/generate")
-
-print(
-    "\nChat:"
-)
-print(tunnel_url + "/api/chat")
-
-print(
-    "\nLocal API:"
-)
-print(OLLAMA_API)
-
-print(
-    "\nModel:"
-)
-print(OLLAMA_MODEL)
-
-print("\nProcesses will remain running while this Kaggle session is alive.")
-print("Do NOT stop this Python process if you want the tunnel to remain active.")
-
-
-# ============================================================
-# KEEP SCRIPT ALIVE
-# ============================================================
+if not CLOUDFLARED_LOG.exists():
+    continue
 
 try:
-    while True:
-        time.sleep(30)
+    log_content = CLOUDFLARED_LOG.read_text(
+        encoding="utf-8",
+        errors="replace",
+    )
+except Exception:
+    continue
 
-        # Check Ollama
-        ollama_status, _ = http_get(
-            f"{OLLAMA_API}/api/tags",
-            timeout=5,
+matches = re.findall(
+    r"https://[a-zA-Z0-9-]+\.trycloudflare\.com",
+    log_content,
+)
+
+if matches:
+    public_url = matches[-1]
+    break
+
+
+if public_url:
+log("")
+log("=" * 60)
+log("CLOUDFLARE PUBLIC URL")
+log("=" * 60)
+print(public_url)
+log("=" * 60)
+log("")
+
+else:
+log("WARNING: Cloudflare public URL was not detected.")
+
+
+if CLOUDFLARED_LOG.exists():
+    log("cloudflared log:")
+    print(
+        CLOUDFLARED_LOG.read_text(
+            encoding="utf-8",
+            errors="replace",
+        )[-5000:]
+    )
+
+
+# ============================================================
+
+# TEST LOCAL OLLAMA API
+
+# ============================================================
+
+log("Testing local Ollama API...")
+
+status, body = http_get(
+f"{OLLAMA_API}/api/tags",
+timeout=10,
+)
+
+if status == 200:
+log("LOCAL API TEST: OK")
+else:
+log(
+f"LOCAL API TEST FAILED "
+f"(HTTP {status})"
+)
+
+# ============================================================
+
+# TEST PUBLIC OLLAMA API
+
+# ============================================================
+
+if public_url:
+log("Testing public Ollama API...")
+
+
+public_api_url = (
+    f"{public_url}/api/tags"
+)
+
+public_status = None
+
+for attempt in range(10):
+    public_status, public_body = http_get(
+        public_api_url,
+        timeout=15,
+    )
+
+    if public_status == 200:
+        break
+
+    log(
+        f"Public API attempt "
+        f"{attempt + 1}/10 failed: "
+        f"HTTP {public_status}"
+    )
+
+    time.sleep(3)
+
+if public_status == 200:
+    log("PUBLIC API TEST: OK")
+
+    print("")
+    print("Public Ollama API:")
+    print(public_api_url)
+    print("")
+
+else:
+    log(
+        "PUBLIC API TEST FAILED."
+    )
+
+    log(
+        "This usually means the tunnel "
+        "cannot reach the Ollama origin."
+    )
+
+    log("")
+    log("Ollama log:")
+    try:
+        print(
+            OLLAMA_LOG.read_text(
+                encoding="utf-8",
+                errors="replace",
+            )[-3000:]
+        )
+    except Exception:
+        pass
+
+    log("")
+    log("cloudflared log:")
+    try:
+        print(
+            CLOUDFLARED_LOG.read_text(
+                encoding="utf-8",
+                errors="replace",
+            )[-5000:]
+        )
+    except Exception:
+        pass
+
+
+# ============================================================
+
+# FINAL STATUS
+
+# ============================================================
+
+print("")
+print("=" * 70)
+print("KAGGLE OLLAMA SETUP COMPLETE")
+print("=" * 70)
+
+print(f"Model        : {OLLAMA_MODEL}")
+print(f"GGUF         : {MODEL_PATH}")
+print(f"Ollama API   : {OLLAMA_API}")
+
+if public_url:
+print(f"Public URL   : {public_url}")
+print(f"Public API   : {public_url}/api")
+print(f"Tags         : {public_url}/api/tags")
+else:
+print("Public URL   : NOT DETECTED")
+
+print("")
+print("Processes:")
+print(f"Ollama PID   : {read_pid_file(OLLAMA_PID_FILE)}")
+print(
+f"Cloudflared  : "
+f"{read_pid_file(CLOUDFLARED_PID_FILE)}"
+)
+
+print("=" * 70)
+print("")
+
+# ============================================================
+
+# KEEP NOTEBOOK PROCESS ALIVE
+
+# ============================================================
+
+log(
+"Keeping Kaggle session alive. "
+"Press Stop/Interrupt to terminate this script."
+)
+
+try:
+while True:
+time.sleep(30)
+
+
+    # Basic process monitoring.
+    ollama_pid = read_pid_file(OLLAMA_PID_FILE)
+    cloudflared_pid = read_pid_file(
+        CLOUDFLARED_PID_FILE
+    )
+
+    if ollama_pid and not process_alive(ollama_pid):
+        log(
+            "WARNING: Ollama process is no longer running."
         )
 
-        # Check cloudflared
-        cloudflared_alive = cloudflared_process.poll() is None
+    if cloudflared_pid and not process_alive(
+        cloudflared_pid
+    ):
+        log(
+            "WARNING: cloudflared process is no longer running."
+        )
 
-        if ollama_status != 200:
-            print("WARNING: Ollama API is no longer responding.")
-
-        if not cloudflared_alive:
-            print("WARNING: cloudflared process stopped.")
-            break
 
 except KeyboardInterrupt:
-    pass
+log("Setup process interrupted.")
 
 finally:
-    terminate_processes()
+log("Exiting setup.py.")
+log(
+"Background processes may remain active "
+"until the Kaggle session is terminated."
+)
