@@ -488,16 +488,66 @@ print("")
 # SHOW CLOUDFLARED LOG IF URL WAS NOT FOUND
 # ============================================================
 
-if not PUBLIC_URL:
-    log("Cloudflare URL was not detected.")
+# if not PUBLIC_URL:
+#     log("Cloudflare URL was not detected.")
 
-    if CLOUDFLARED_LOG.exists():
+#     if CLOUDFLARED_LOG.exists():
+#         print(
+#             CLOUDFLARED_LOG.read_text(
+#                 encoding="utf-8",
+#                 errors="replace",
+#             )[-5000:]
+#         )
+
+
+if PUBLIC_URL:
+    PUBLIC_API = f"{PUBLIC_URL}/api/tags"
+
+    log(f"Testing public API: {PUBLIC_API}")
+
+    try:
+        request = urllib.request.Request(
+            PUBLIC_API,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json",
+            },
+        )
+
+        with urllib.request.urlopen(
+            request,
+            timeout=15,
+        ) as response:
+            body = response.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+
+            print("")
+            print("=" * 70)
+            print("PUBLIC OLLAMA API: OK")
+            print("=" * 70)
+            print(f"URL: {PUBLIC_API}")
+            print(body)
+            print("=" * 70)
+            print("")
+
+    except Exception as error:
+        print("")
+        print("=" * 70)
+        print("PUBLIC OLLAMA API: FAILED")
+        print("=" * 70)
+        print(error)
+        print("")
+        print("Cloudflared log:")
         print(
             CLOUDFLARED_LOG.read_text(
                 encoding="utf-8",
                 errors="replace",
             )[-5000:]
         )
+        print("=" * 70)
+        print("")
 
 # ============================================================
 # KEEP KAGGLE SESSION ALIVE
