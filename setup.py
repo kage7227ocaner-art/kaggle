@@ -419,7 +419,7 @@ cloudflared_process = subprocess.Popen(
         "tunnel",
         "--no-autoupdate",
         "--url",
-        OLLAMA_URL,
+        "http://127.0.0.1:11434",
     ],
     stdout=cloudflared_log,
     stderr=subprocess.STDOUT,
