@@ -543,4 +543,3 @@ except KeyboardInterrupt:
 
 finally:
     terminate_processes()
-```
