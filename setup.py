@@ -300,7 +300,7 @@ log("Creating Modelfile...")
 MODELFILE.write_text(
     f"""FROM {MODEL_PATH}
 
-PARAMETER num_ctx 8192
+PARAMETER num_ctx 32768
 PARAMETER temperature 0.7
 PARAMETER top_p 0.9
 """,
